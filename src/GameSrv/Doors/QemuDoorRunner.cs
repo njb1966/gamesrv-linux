@@ -119,6 +119,10 @@ public class QemuDoorRunner : IDoorRunner
             // Door game uses FOSSIL on COM1 for serial I/O directly.
             // No CTTY COM1 needed - avoids DOS noise in the serial stream.
             $"{command} {parameters}".Trim(),
+            // Send exit sentinel via FOSSIL (BNU) on COM1 so GameSrv detects exit immediately
+            "CTTY COM1",
+            "ECHO **DOOREXIT**",
+            "CTTY CON",
         };
 
         File.WriteAllText(Path.Combine(nodeDir, "external.bat"), string.Join("\r\n", lines));
@@ -310,6 +314,10 @@ public class QemuDoorRunner : IDoorRunner
 
         // Task: serial -> client (read from QEMU, send to user)
         long totalSerialBytes = 0;
+        bool doorExited = false; // Set when **DOOREXIT** sentinel is detected
+        string sentinelBuffer = ""; // Accumulates tail of serial data to detect sentinel across reads
+        const string DoorExitSentinel = "**DOOREXIT**";
+
         var serialToClient = Task.Run(() =>
         {
             try
@@ -323,9 +331,34 @@ public class QemuDoorRunner : IDoorRunner
                         if (bytesRead > 0)
                         {
                             totalSerialBytes += bytesRead;
-                            if (totalSerialBytes == bytesRead)
+                            if (totalSerialBytes <= bytesRead)
                                 Log.Info($"First serial data received: {bytesRead} bytes");
                             lastSerialDataTicks = Environment.TickCount64;
+
+                            // Check for door exit sentinel in the serial data
+                            string chunk = System.Text.Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                            sentinelBuffer += chunk;
+
+                            // Keep only enough to detect the sentinel spanning two reads
+                            if (sentinelBuffer.Length > DoorExitSentinel.Length * 2 + bytesRead)
+                                sentinelBuffer = sentinelBuffer[^(DoorExitSentinel.Length + bytesRead)..];
+
+                            if (sentinelBuffer.Contains(DoorExitSentinel))
+                            {
+                                Log.Info("Door exit sentinel detected");
+                                doorExited = true;
+
+                                // Strip the sentinel and any CTTY noise from output to user
+                                int sentinelPos = chunk.IndexOf(DoorExitSentinel, StringComparison.Ordinal);
+                                if (sentinelPos > 0)
+                                {
+                                    // Send data before the sentinel
+                                    ni.Connection!.WriteBytes(buffer, sentinelPos);
+                                }
+                                // Don't send the sentinel or anything after it
+                                break;
+                            }
+
                             ni.Connection!.WriteBytes(buffer, bytesRead);
                         }
                         else if (bytesRead == 0)
@@ -345,6 +378,13 @@ public class QemuDoorRunner : IDoorRunner
         while (!clientThread.QuitThread() && !qemuProcess.HasExited)
         {
             dataTransferred = false;
+
+            // Check if door exit sentinel was detected
+            if (doorExited)
+            {
+                Log.Info("Door exit detected via sentinel, ending I/O bridge");
+                break;
+            }
 
             // Check for exception in read task
             if (readException != null)
@@ -394,7 +434,7 @@ public class QemuDoorRunner : IDoorRunner
                 long idleMs = Environment.TickCount64 - lastSerialDataTicks;
                 if (idleMs > serialIdleTimeoutMs && !ni.Connection.CanRead())
                 {
-                    Log.Info($"No serial data for {idleMs}ms - door game has exited");
+                    Log.Info($"No serial data for {idleMs}ms - door game has exited (totalSerial={totalSerialBytes}, connected={ni.Connection.Connected})");
                     break;
                 }
 

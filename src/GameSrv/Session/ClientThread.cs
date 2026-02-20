@@ -184,8 +184,11 @@ public class ClientThread : IDisposable
         string password = rlogin.ClientUserName;
         string termType = rlogin.TerminalType;
 
+        Log.Info($"RLogin auth: user='{userName}' pass='{password}' term='{termType}'");
+
         if (string.IsNullOrEmpty(userName) || string.IsNullOrEmpty(password))
         {
+            Log.Info("RLogin auth failed: empty username or password");
             if (ServerConfig.Instance.RLoginPromptForCredentialsOnFailedLogOn)
                 return AuthenticateTelnet();
             DisplayAnsi("RLOGIN_INVALID");
@@ -195,9 +198,12 @@ public class ClientThread : IDisposable
         // Check for xtrn= door request
         if (termType.StartsWith("xtrn=", StringComparison.OrdinalIgnoreCase))
         {
-            _nodeInfo.Door = new DoorInfo(termType.Substring(5));
+            string doorName = termType.Substring(5);
+            Log.Info($"RLogin xtrn door request: '{doorName}'");
+            _nodeInfo.Door = new DoorInfo(doorName);
             if (!_nodeInfo.Door.Loaded)
             {
+                Log.Warning($"RLogin xtrn door not found: '{doorName}'");
                 DisplayAnsi("RLOGIN_INVALID_XTRN");
                 return false;
             }
@@ -214,12 +220,9 @@ public class ClientThread : IDisposable
                 return false;
             }
         }
-        else if (ServerConfig.Instance.RLoginPromptForCredentialsOnFailedLogOn)
-        {
-            return AuthenticateTelnet();
-        }
         else
         {
+            // New user - auto-register if configured, otherwise prompt or reject
             if (ServerConfig.Instance.RLoginSkipNewUserPrompts)
             {
                 if (IpFilter.IsBannedUser(userName))
